@@ -8,6 +8,7 @@ import oauth.OAuth._
 import dispatch.Request._
 import sys.process._
 import org.specs2.specification._
+import org.specs2._
 
 object Trello {
   val host = :/("api.trello.com") / "1"
@@ -15,21 +16,15 @@ object Trello {
   val token = config._1
   val key = config._2
   val params:Map[String, String] = Map(("key" -> key), ("token" -> token), ("cards" -> "all"), ("card_fields" -> "all"), ("lists" -> "all"), ("checklists" -> "all"))
-  val packageName = "com.redvblack.dispatch.trello"
-  val projectRoot = "/Users/bufferine/Dev/TrelloSpecs2Generator"
-  val testPath = "/src/test/scala"
-  val specName = "TrelloSpec"
-  val specFileName = projectRoot + testPath + "/" + packageName.replace(".", "/") + "/GeneratedSpec.scala"
-  val boardId = "BoardId"
 
-  def generateOrUpdate = {
-      if (!(new java.io.File(specFileName).exists)) {
-        generateTestCases
+  def generateOrUpdate(boardId:String, packageName:String, specFile:String, label:Option[String] = None) = {
+      if (!(new java.io.File(specFile).exists)) {
+        generateTestCases(boardId, packageName, specFile, label)
       }else {
-        val specs = loadExistingSpecs
-        val board = loadBoard
-        val compare = compareSpecToBoard(specs, board)
-        insertIntoSpec(specs, board, compare)
+        val board = loadBoard(boardId)
+        val specs = loadExistingSpecs(boardId, packageName, board.specName)
+        val compare = compareSpecToBoard(specs, board, label)
+        insertIntoSpec(specFile, specs, board, compare)
       }
   }
 
@@ -47,33 +42,40 @@ object Trello {
       }
     }
   }
+  def loadExistingSpecsInSpecs(packageName:String, specName:String):Specification = {
+    Class.forName(packageName + "." + specName).newInstance.asInstanceOf[Specification]
+  }
 
-  def loadExistingSpecs:Map[String, Fragment] = {
-    val es = Class.forName(packageName + "." + specName)
-    val instance = es.newInstance
-    val field = es.getDeclaredField("specFragments")
-      field.setAccessible(true)
-    val fragments:org.specs2.specification.Fragments = field.get(instance).asInstanceOf[Fragments]
-    // anything with a string inside square brackets, assume to be generated from Trello
+  def loadExistingSpecs(boardId:String, packageName:String, specName:String):Map[String, Fragment] = {
+    try{
+      val es = Class.forName(packageName + "." + specName)
+      val instance = es.newInstance
+      val field = es.getDeclaredField("specFragments")
+        field.setAccessible(true)
+      val fragments:org.specs2.specification.Fragments = field.get(instance).asInstanceOf[Fragments]
+      // anything with a string inside square brackets, assume to be generated from Trello
 
-    fragments.fragments.flatMap(f => {
-      val IDed = ".*\\[(.*)\\](.*)".r
-      f.toString match {
-        case IDed(id, text) =>  Some(id -> f)
-        case _ => None
-      }
-    }).toMap
+      fragments.fragments.flatMap(f => {
+        val IDed = ".*\\[(.*)\\](.*)".r
+        f.toString match {
+          case IDed(id, text) =>  Some(id -> f)
+          case _ => None
+        }
+      }).toMap
+    }catch {
+      case c:ClassNotFoundException => Map[String, Fragment]()// no spec yet - return empty map
+    }
   }
 
 
-  def loadBoard:BoardCase = {
+  def loadBoard(boardId:String):BoardCase = {
     // grab the boards, and the cards for the boards
     Http(Board(boardId).get).get
   }
 
-  def compareSpecToBoard(specs:Map[String, Fragment], trello:BoardCase):Pair[List[String], List[String]] = {
+  def compareSpecToBoard(specs:Map[String, Fragment], trello:BoardCase, label:Option[String] = None):Pair[List[String], List[String]] = {
     // flatten out all the ids available in the board
-    val cardMap = trello.cards.map(c => c.id -> c).toMap
+    val cardMap = trello.cards.filter(card => card.labels.map(l => Some(l.name)).contains(label)).map(c => c.id -> c).toMap
     val listMap = trello.lists.map(l => l.id -> l).toMap
     val checkListsMap = trello.checklists.map(c => c.id -> c).toMap
     val checkListItems = checkListsMap.values.flatMap(cl => {
@@ -111,7 +113,7 @@ object Trello {
         )
   }
 
-  def insertIntoSpec(specs:Map[String, Fragment], trello:BoardCase, missings:Pair[List[String], List[String]]) = {
+  def insertIntoSpec(specFileName:String, specs:Map[String, Fragment], trello:BoardCase, missings:Pair[List[String], List[String]]) = {
     var specFile:List[String] = try {
       scala.io.Source.fromFile(specFileName).getLines.toList
     }catch {
@@ -154,26 +156,27 @@ object Trello {
         // find the checkList this belongs in, add it straight after
 //      }
     })
-//    println(specFile.mkString("\n"))
     val out = new java.io.FileWriter(specFileName)
     out.write(specFile.mkString("\n"))
+    println("Written " + specFileName)
     out.close
   }
 
-  def generateTestCases = {
+  def generateTestCases(boardId:String, packageName:String, specFileName:String, label:Option[String]) = {
     // grab the boards, and the cards for the boards
     val board:BoardCase = Http(Board(boardId).get).get
-    // for each card, generate a test
+    // for each card, generate a test filtered by label if provided
     val testCase = List(" package " + packageName +
     " \nimport org.specs2.mutable._ " +
     " \nimport org.specs2.specification._ " +
-    " \nclass GeneratedSpec extends Specification { ") :::
-    board.cards.map(card => {
+    " \nclass " + board.specName + " extends Specification { ") :::
+    board.cards.filter(card => card.labels.map(l => Some(l.name)).contains(label)).map(card => {
       toSpec(card)
     }).foldLeft(List[String]())((acc, next) => acc ::: next) ::: List("\npending\n}")
 
     val out = new java.io.FileWriter(specFileName)
     out.write(testCase.mkString(""))
+    println("Written " + specFileName)
     out.close
   }
 }
@@ -262,7 +265,15 @@ case class BoardCase(val name:String
                      , val lists:List[BoardList]
                      , val members:List[Member]
                      , val checklists:List[CheckList]
-                      )
+                      ){
+
+  // Trello sanitizes the board name already, but doesn't expose it alone. to keep things consistent grab it from the url
+  val specName = name.toLowerCase.toCharArray.toList match {
+    case head :: tail => {
+      ((if (Character.isJavaIdentifierStart(new Character(head))) head else "") + new String(tail.flatMap(c => if (Character.isJavaIdentifierPart(new Character(c))) Some(c) else None).toArray)).capitalize
+    }
+  }
+}
 case class Member(val id:String, val avatarSource:Option[String], val bio:Option[String], val fullName:Option[String], val gravatarHash:Option[String]
 , idBoards:List[String], val idBoardsInvited:List[String], val idBoardsPinned:List[String], val idOrganizations:List[String], val idOrganizationsInvited:List[String]
 , initials:Option[String], val prefs:Option[MemberPrefs], val status:Option[String], val url:Option[String], val username:Option[String])
